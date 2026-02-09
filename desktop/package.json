@@ -1,14 +1,26 @@
-﻿{
+{
   "name": "contracts-ai-desktop",
   "version": "1.0.0",
   "private": true,
+  "description": "ContractAI Pro Desktop",
+  "author": "ContractAI",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
     "build:mac": "electron-builder --mac dmg"
   },
   "devDependencies": {
-    "electron": "^31.0.0",
+    "electron": "^29.0.0",
     "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "productName": "ContractAI Pro",
+    "appId": "com.contractai.pro",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "category": "public.app-category.business"
+    }
   }
 }
