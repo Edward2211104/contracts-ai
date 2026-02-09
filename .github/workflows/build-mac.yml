@@ -16,35 +16,36 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            contracts-ui/package-lock.json
+            contracts-gateway/package-lock.json
+            desktop/package-lock.json
 
-      - name: Install UI deps + build (optional)
+      - name: Install UI deps
         run: |
           cd contracts-ui
           npm install
-          # If your UI supports build:
-          npm run build || true
 
       - name: Install Gateway deps
         run: |
           cd contracts-gateway
           npm install
 
-      - name: Setup Python backend venv (optional)
-        run: |
-          cd contracts-llm
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install fastapi uvicorn; fi
-
-      - name: Build Electron DMG
+      - name: Install Desktop deps
         run: |
           cd desktop
           npm install
+
+      - name: Build macOS (Electron)
+        env:
+          CI: "true"
+        run: |
+          cd desktop
           npm run build:mac
 
-      - name: Upload artifact
+      - name: Upload artifact (dist)
         uses: actions/upload-artifact@v4
         with:
-          name: ContractAIPro-mac-dmg
-          path: desktop/dist/*.dmg
+          name: ContractAIPro-mac-dist
+          path: desktop/dist/**
