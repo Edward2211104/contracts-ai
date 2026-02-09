@@ -1,0 +1,107 @@
+﻿import os
+import logging
+from typing import List, Dict, Any
+
+import httpx
+from pydantic import BaseModel
+
+logger = logging.getLogger("contracts-llm")
+
+
+class BasicAskResponse(BaseModel):
+    ok: bool = True
+    answer: str = ""
+
+
+def _get_upstream_base_url() -> str:
+    """
+    URL base del servidor LLM (LM Studio compatible OpenAI).
+    Ej: http://localhost:1234
+    """
+    return os.getenv("UPSTREAM_LLM_BASE_URL", "http://localhost:1234")
+
+
+def _get_upstream_model() -> str:
+    """
+    Nombre del modelo configurado en LM Studio.
+    Ej: openai/gpt-oss-20b
+    """
+    return os.getenv("UPSTREAM_LLM_MODEL", "openai/gpt-oss-20b")
+
+
+def _build_messages(question: str, context: str, has_contract: bool) -> List[Dict[str, Any]]:
+    """
+    Construye el array de mensajes para /v1/chat/completions.
+    """
+    system_prompt = (
+        "You are a helpful, cautious legal assistant. "
+        "Answer in clear, plain English unless the user asks for Spanish. "
+        "If you are not sure, say you are not sure and explain why."
+    )
+
+    user_content = (
+        f"User question:\n{question}\n\n"
+        f"Background context:\n{context or '(no extra context)'}\n\n"
+        f"Has contract text loaded in the app: {has_contract}.\n"
+        "Answer step by step, in a concise way, and highlight key risks or caveats."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def ask_basic(question: str, context: str, has_contract: bool = False) -> BasicAskResponse:
+    """
+    Llamada síncrona al modelo de LM Studio usando la API tipo OpenAI.
+    No hace RAG todavía; solo usa la pregunta + contexto de alto nivel.
+    """
+    base_url = _get_upstream_base_url().rstrip("/")
+    model = _get_upstream_model()
+    url = f"{base_url}/v1/chat/completions"
+
+    messages = _build_messages(question=question, context=context, has_contract=has_contract)
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        # Opcional: controla verbosidad / longitud
+        "temperature": 0.3,
+        "max_tokens": 512,
+    }
+
+    try:
+        logger.info("Calling upstream LLM at %s with model %s", url, model)
+        resp = httpx.post(url, json=payload, timeout=60.0)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.exception("Error calling upstream LLM: %s", e)
+        return BasicAskResponse(ok=False, answer=f"Upstream LLM error: {e}")
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.exception("Could not parse upstream JSON: %s", e)
+        return BasicAskResponse(ok=False, answer=f"Upstream LLM returned invalid JSON: {e}")
+
+    choices = data.get("choices") or []
+    if not choices:
+        logger.warning("Upstream LLM returned no choices: %s", data)
+        return BasicAskResponse(ok=False, answer="Upstream LLM returned no answer.")
+
+    message = choices[0].get("message") or {}
+    answer_text = (message.get("content") or "").strip()
+    if not answer_text:
+        logger.warning("Upstream LLM returned empty content: %s", data)
+        return BasicAskResponse(ok=False, answer="Upstream LLM returned an empty answer.")
+
+    return BasicAskResponse(ok=True, answer=answer_text)
+
+
+def ask_basic_llm(question: str, context: str, has_contract: bool = False) -> BasicAskResponse:
+    """
+    Wrapper de compatibilidad para main.py:
+      from llm_proxy import ask_basic_llm
+    """
+    return ask_basic(question=question, context=context, has_contract=has_contract)

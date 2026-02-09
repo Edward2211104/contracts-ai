@@ -1,0 +1,142 @@
+﻿import logging
+import os
+from typing import List, Dict, Optional
+
+import httpx
+
+logger = logging.getLogger("contracts-llm")
+
+# Puede ser solo "http://localhost:1234" o ya traer "/v1/chat/completions"
+UPSTREAM_LLM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "META-LLAMA-3-8B-Instruct")
+
+
+def _resolve_chat_url() -> str:
+    """
+    Construye la URL final para /v1/chat/completions SIN duplicarla.
+    Si la variable ya trae /v1/chat/completions, se usa tal cual.
+    Si no, se le añade ese sufijo.
+    """
+    base = (UPSTREAM_LLM_URL or "").rstrip("/")
+    if not base:
+        base = "http://localhost:1234"
+
+    if "/v1/chat/completions" in base:
+        return base
+
+    return f"{base}/v1/chat/completions"
+
+
+def _chat(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> str:
+    """
+    Llamada de bajo nivel al servidor local tipo OpenAI (LM Studio).
+    """
+    url = _resolve_chat_url()
+    model_name = model or UPSTREAM_LLM_MODEL
+
+    payload: Dict[str, object] = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    logger.info("Calling upstream LLM at %s with model %s", url, model_name)
+
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    # Si LM Studio devuelve error tipo {'error': '...'}
+    if isinstance(data, dict) and "error" in data:
+        err_msg = str(data.get("error"))
+        logger.error("Upstream LLM error: %s", err_msg)
+        return f"Upstream LLM error: {err_msg}"
+
+    choices = data.get("choices") or []
+    if not choices:
+        logger.warning("Upstream LLM returned no choices: %s", data)
+        return ""
+
+    message = choices[0].get("message") or {}
+    content = message.get("content") or ""
+    return str(content)
+
+
+def call_lm_studio(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> str:
+    """
+    Función pública usada por los endpoints FastAPI para hacer chat genérico.
+    """
+    return _chat(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def build_contract_messages(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> List[Dict[str, str]]:
+    """
+    Construye un prompt enfocado en contratos. Siempre incluye el texto
+    del contrato si está disponible.
+    """
+    contract_text = (contract_text or "").strip()
+    extra_context = (extra_context or "").strip()
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, residential lease and insurance "
+        "contracts. Always base your answers on the CONTRACT TEXT provided. "
+        "Quote or paraphrase the exact clauses that justify your answer and then "
+        "explain them in clear language. If the contract does not clearly answer, "
+        "say so explicitly and explain what is missing."
+    )
+
+    parts = [
+        "CONTRACT TEXT:",
+        contract_text or "[No contract text was provided.]",
+        "",
+        "QUESTION:",
+        question.strip(),
+    ]
+
+    if extra_context:
+        parts.extend(["", "ADDITIONAL CONTEXT:", extra_context])
+
+    user_message = "\n".join(parts)
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def answer_contract_question(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> str:
+    """
+    Punto de entrada de alto nivel para responder preguntas legales
+    usando el texto completo del contrato.
+    """
+    messages = build_contract_messages(
+        question=question,
+        contract_text=contract_text,
+        extra_context=extra_context,
+    )
+    return call_lm_studio(messages)

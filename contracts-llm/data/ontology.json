@@ -1,0 +1,14 @@
+﻿{
+  "version": "0.1",
+  "families": ["lease", "insurance", "services", "telecom"],
+  "clause_types": [
+    {"id": "termination", "name": "Termination / Early termination", "signals": ["terminate","early termination","without cause","penalty"]},
+    {"id": "damages", "name": "Damage / Indemnity", "signals": ["damages","indemnify","hold harmless","loss"]},
+    {"id": "liability_cap", "name": "Limitation of Liability", "signals": ["liability","cap","maximum liability","consequential"]},
+    {"id": "notice", "name": "Notice / Cure Period", "signals": ["notice","days","cure","written notice"]},
+    {"id": "assignment", "name": "Assignment / Subletting", "signals": ["assign","assignment","sublet","transfer"]},
+    {"id": "governing_law", "name": "Governing Law / Dispute", "signals": ["governing law","jurisdiction","venue","arbitration"]},
+    {"id": "renewal", "name": "Term / Renewal", "signals": ["renew","auto-renew","term","expiration"]},
+    {"id": "exclusions", "name": "Coverage Exclusions", "signals": ["exclusion","excluded","does not cover","flood","theft"]}
+  ]
+}

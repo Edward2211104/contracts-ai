@@ -1,0 +1,179 @@
+﻿import os
+import json
+import logging
+from typing import Optional, Dict, Any
+
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# ---------------------------------------------------------------------
+# Configuración: URL y modelo del servidor de LM Studio
+# ---------------------------------------------------------------------
+UPSTREAM_LLM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234/v1/chat/completions")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "openai/gpt-oss-20b")
+UPSTREAM_LLM_MAX_TOKENS = int(os.getenv("UPSTREAM_LLM_MAX_TOKENS", "1024"))
+
+app = FastAPI()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("contracts-llm-proxy")
+
+
+# ---------------------------------------------------------------------
+# Esquemas de entrada
+# ---------------------------------------------------------------------
+class BasicAskRequest(BaseModel):
+    question: str
+
+
+class RagAskRequest(BaseModel):
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+# ---------------------------------------------------------------------
+# Función auxiliar para llamar a LM Studio (servidor OpenAI-like)
+# ---------------------------------------------------------------------
+def call_lm_studio(messages, max_tokens: int = UPSTREAM_LLM_MAX_TOKENS, temperature: float = 0.15) -> str:
+    payload = {
+        "model": UPSTREAM_LLM_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+
+    try:
+        resp = requests.post(UPSTREAM_LLM_URL, json=payload, timeout=120)
+    except requests.RequestException as e:
+        logger.exception("Error llamando al LLM upstream")
+        raise HTTPException(status_code=502, detail=f"Error calling upstream LLM: {e}")
+
+    if resp.status_code != 200:
+        logger.error("Respuesta no-200 del LLM upstream: %s - %s", resp.status_code, resp.text[:500])
+        raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
+
+    try:
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.exception("Error procesando la respuesta del LLM upstream")
+        raise HTTPException(status_code=500, detail=f"Malformed response from LLM: {e}")
+
+
+# ---------------------------------------------------------------------
+# Healthcheck sencillo
+# ---------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "llm_url": UPSTREAM_LLM_URL, "model": UPSTREAM_LLM_MODEL}
+
+
+# ---------------------------------------------------------------------
+# Endpoint básico (sin RAG) - opcional, para pruebas simples
+# ---------------------------------------------------------------------
+@app.post("/llm/ask-basic")
+def ask_basic(body: BasicAskRequest):
+    system_prompt = (
+        "You are an expert lawyer in commercial, insurance, and real-estate contracts. "
+        "Answer clearly, concisely, and avoid hallucinating. If the question cannot be "
+        "answered with the information provided, explicitly say so."
+    )
+
+    user_prompt = body.question.strip()
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    answer = call_lm_studio(messages)
+    return {"ok": True, "answer": answer}
+
+
+# ---------------------------------------------------------------------
+# Endpoint principal usado por Contracts-AI: RAG + contexto de contrato
+# ---------------------------------------------------------------------
+@app.post("/rag/ask")
+def rag_ask(body: RagAskRequest):
+    """
+    Este endpoint recibe:
+      - question: pregunta del usuario
+      - contractText: texto completo del contrato (opcional)
+      - extraContext: contexto adicional (opcional)
+      - metadata: diccionario con metadatos estructurados (opcional)
+
+    Si contractText viene vacío, usamos TODO el resto del payload como contexto.
+    Así, aunque el backend de Node envíe otros campos, siempre habrá información
+    para que el LLM razone sobre el contrato seleccionado.
+    """
+
+    # ------------------- Construir el contexto del contrato -------------------
+    context_parts = []
+
+    if body.contractText and body.contractText.strip():
+        context_parts.append("Full contract text:\n" + body.contractText.strip())
+    else:
+        # Si no hay contractText, usamos metadata / extraContext / resto del payload
+        meta_chunks = []
+
+        if body.metadata:
+            try:
+                meta_json = json.dumps(body.metadata, ensure_ascii=False, indent=2)
+                meta_chunks.append("Structured metadata:\n" + meta_json)
+            except Exception:
+                # Mejor algo que nada
+                meta_chunks.append("Structured metadata (raw):\n" + str(body.metadata))
+
+        if body.extraContext:
+            meta_chunks.append("Additional context:\n" + body.extraContext.strip())
+
+        # Como último recurso, usamos TODO el payload (menos la pregunta) como JSON
+        if not meta_chunks:
+            raw_payload = body.model_dump()
+            raw_payload.pop("question", None)
+            try:
+                raw_json = json.dumps(raw_payload, ensure_ascii=False, indent=2)
+            except Exception:
+                raw_json = str(raw_payload)
+            meta_chunks.append("Raw contract payload:\n" + raw_json)
+
+        context_parts.append("\n\n".join(meta_chunks))
+
+    contract_context = "\n\n".join(context_parts)
+
+    # ------------------- Mensajes para el LLM -------------------
+    system_prompt = (
+        "You are an expert lawyer specialized in all kinds of contracts: "
+        "commercial, insurance, employment, leases, service agreements, NDAs, etc. "
+        "You ONLY answer based on the contract information provided below. "
+        "Do not invent clauses. If the contract does not clearly answer the question, "
+        "say that it is not specified or that more information is needed.\n\n"
+        "When you answer:\n"
+        "- First, give a short direct answer (2-3 sentences).\n"
+        "- Then, cite the relevant clauses or paragraphs, quoting the exact text when possible.\n"
+        "- If there is any ambiguity or risk, briefly explain it."
+    )
+
+    user_prompt = f"""User question:
+{body.question.strip()}
+
+Contract information (text, metadata and context):
+{contract_context}
+"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    logger.info("Calling upstream LLM for RAG question.")
+    answer = call_lm_studio(messages)
+
+    return {
+        "ok": True,
+        "answer": answer,
+    }
+

@@ -1,0 +1,138 @@
+﻿import os
+from typing import Any, Dict
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+
+# ============================================================
+# App básica de FastAPI para Contracts-AI (backend LLM)
+# ============================================================
+app = FastAPI(title="Contracts-AI LLM backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================
+# Configuración de LM Studio (servidor local OpenAI-like)
+# ============================================================
+LM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234/v1/chat/completions")
+LM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "openai/gpt-oss-20b")
+LM_MAX_TOKENS = int(os.getenv("UPSTREAM_LLM_MAX_TOKENS", "1024"))
+LM_TEMPERATURE = float(os.getenv("UPSTREAM_LLM_TEMPERATURE", "0.2"))
+
+# ============================================================
+# Health check usado por Node
+# ============================================================
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {"status": "ok", "model": LM_MODEL}
+
+# ============================================================
+# Función genérica para llamar a LM Studio
+# ============================================================
+async def call_lm_studio(messages: list[dict]) -> str:
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        response = await client.post(
+            LM_URL,
+            json={
+                "model": LM_MODEL,
+                "messages": messages,
+                "max_tokens": LM_MAX_TOKENS,
+                "temperature": LM_TEMPERATURE,
+            },
+        )
+    response.raise_for_status()
+    data = response.json()
+
+    # Formato OpenAI-like
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return str(data)
+
+# ============================================================
+# /llm/ask-basic -> usado por tu frontend (Contracts-AI)
+# Aquí hacemos a la IA ultra experta en contratos y le
+# enviamos SIEMPRE el texto del contrato que viene de Node.
+# ============================================================
+@app.post("/llm/ask-basic")
+async def ask_basic(request: Request) -> Dict[str, Any]:
+    body = await request.json()
+
+    question = (body.get("question") or "").strip()
+    contract_text = (
+        body.get("contractText")
+        or body.get("contract_text")
+        or ""
+    ).strip()
+    extra_context = (
+        body.get("extraContext")
+        or body.get("extra_context")
+        or ""
+    ).strip()
+
+    # Prompt principal: cerebro experto en contratos
+    system_prompt = (
+        "You are a senior expert lawyer specialized in commercial, rental, "
+        "construction, and insurance contracts. You answer ONLY based on the "
+        "contract text provided by the system. If the contract does not clearly "
+        "address the question, you say so explicitly. Use precise legal language "
+        "but explain in clear, simple terms."
+    )
+
+    if not contract_text:
+        # Si por alguna razón no nos mandan el contrato, respondemos claro.
+        user_prompt = f"""
+The user asked a legal question about a contract, but NO contract text was provided
+in the 'contractText' field of the API.
+
+User question:
+{question}
+
+Extra context from the app:
+{extra_context}
+
+Explain that you need the full contract text in order to give a precise answer.
+You may mention typical clauses that are usually relevant, but be very clear that
+you have NOT seen the actual contract.
+""".strip()
+    else:
+        # Caso normal: tenemos el contrato completo
+        user_prompt = f"""
+You will receive a contract and a question about it.
+
+RULES:
+- Answer ONLY using the contract text below.
+- If the answer is clearly stated, quote 1-3 key phrases or clauses (short quotes).
+- If the answer is ambiguous or not covered, say that the contract does not
+  explicitly address the question.
+- If relevant, structure the answer with bullet points or numbered items.
+
+QUESTION:
+{question}
+
+EXTRA CONTEXT FROM THE APP (metadata like names, dates, total cost, etc.):
+{extra_context}
+
+CONTRACT TEXT (analyze this very carefully and base your answer ONLY on this text):
+\"\"\"
+{contract_text}
+\"\"\"
+""".strip()
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    answer = await call_lm_studio(messages)
+    return {
+        "ok": True,
+        "answer": answer,
+    }

@@ -1,0 +1,39 @@
+﻿param(
+    [Parameter(Mandatory = $false)]
+    [string]$Question = "According to the indexed homeowners policies, what is typically covered under Coverage A (Dwelling) and what main exclusions apply?"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+Write-Host "`n[TEST] POST /llm/ask-basic ..." -ForegroundColor Cyan
+
+$body = @{
+    question    = $Question
+    context     = "Use the homeowners policies index built from the public PDFs."
+    has_contract = $false
+} | ConvertTo-Json
+
+try {
+    $response = Invoke-WebRequest `
+        -Uri "http://127.0.0.1:4050/llm/ask-basic" `
+        -Method POST `
+        -ContentType "application/json" `
+        -Body $body
+
+    Write-Host "`n[RESPONSE RAW]:" -ForegroundColor Yellow
+    $response.Content
+}
+catch {
+    Write-Host "`n[ERR] Llamada a /llm/ask-basic falló:" -ForegroundColor Red
+    $ex = $_.Exception
+    if ($ex.Response -ne $null) {
+        $resp = $ex.Response
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $bodyText = $reader.ReadToEnd()
+        Write-Host "HTTP $($resp.StatusCode) $($resp.StatusDescription)" -ForegroundColor Red
+        Write-Host $bodyText
+    } else {
+        Write-Host $ex.Message -ForegroundColor Red
+    }
+}

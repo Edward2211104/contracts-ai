@@ -1,0 +1,110 @@
+﻿"""
+llm_proxy.py - FastAPI app that proxies contract questions to LM Studio.
+"""
+
+import os
+import logging
+from typing import Optional, List, Dict, Any
+
+import requests
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+logger = logging.getLogger("llm_proxy")
+logging.basicConfig(level=logging.INFO)
+
+LM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234/v1/chat/completions")
+LM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "openai/gpt-oss-20b")
+LM_MAX_TOKENS = int(os.getenv("UPSTREAM_LLM_MAX_TOKENS", "1024"))
+
+app = FastAPI(title="Contracts LLM proxy")
+
+SYSTEM_PROMPT_BASE = (
+    "You are an expert lawyer in commercial, real-estate and insurance contracts. "
+    "Answer strictly from the contract text provided. "
+    "Always quote the relevant clauses verbatim and then explain them in clear Spanish."
+)
+
+
+class AskBody(BaseModel):
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class AskResponse(BaseModel):
+    ok: bool
+    answer: str
+
+
+def _build_messages(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str],
+) -> List[Dict[str, str]]:
+    system = SYSTEM_PROMPT_BASE
+    if extra_context:
+        system += "\n\nAdditional context:\n" + extra_context
+
+    user_parts = [f"Question: {question}"]
+    if contract_text:
+        user_parts.append("\nContract text:\n" + contract_text)
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n\n".join(user_parts)},
+    ]
+    return messages
+
+
+def call_lm_studio(messages: List[Dict[str, str]]) -> str:
+    payload = {
+        "model": LM_MODEL,
+        "messages": messages,
+        "temperature": 0.15,
+        "max_tokens": LM_MAX_TOKENS,
+    }
+    logger.info("Calling LM Studio at %s with model %s", LM_URL, LM_MODEL)
+    resp = requests.post(LM_URL, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        logger.exception("Unexpected LM Studio response: %s", data)
+        return str(data)
+
+
+def answer_contract_question(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str],
+) -> str:
+    if not contract_text:
+        # Fallback cuando el backend no recibe texto del contrato
+        return (
+            "I cannot see the contract text for this question. "
+            "Please save the contract with its full text or paste the relevant clauses, "
+            "and then ask again."
+        )
+    messages = _build_messages(question, contract_text, extra_context)
+    return call_lm_studio(messages)
+
+
+@app.post("/rag/ask", response_model=AskResponse)
+def rag_ask(body: AskBody) -> AskResponse:
+    """
+    Endpoint principal que usa tu backend Node (/rag/ask).
+    """
+    logger.info(
+        "RAG /rag/ask for question '%s' (has_contract_text=%s)",
+        body.question[:120],
+        bool(body.contractText),
+    )
+    answer = answer_contract_question(
+        question=body.question,
+        contract_text=body.contractText,
+        extra_context=body.extraContext,
+    )
+    return AskResponse(ok=True, answer=answer)

@@ -1,0 +1,31 @@
+﻿# Node
+node_modules/
+dist/
+build/
+.out/
+.next/
+*.log
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS / Editors
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Project archives/backups (important!)
+_archive_local/
+_archive_unused_*/
+contracts-llm_backups/
+_patch_backups/
+_releases/
+docs_release_mac/
+**/*.bak
+**/*.backup*
+**/*.zip
+**/*.tar
+**/*.tar.gz

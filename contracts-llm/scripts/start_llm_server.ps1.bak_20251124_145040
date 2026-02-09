@@ -1,0 +1,32 @@
+﻿$ErrorActionPreference = 'Stop'
+
+# start_llm_server.ps1 - arranca el servidor FastAPI del LLM de contratos
+
+$root      = Resolve-Path (Join-Path $PSScriptRoot '..')
+$venvDir   = Join-Path $root '.venv'
+$pythonExe = Join-Path $venvDir 'Scripts\python.exe'
+$mainFile  = Join-Path $root 'main.py'
+
+if (-not (Test-Path $pythonExe)) {
+    Write-Host '[ERROR] .venv not found or python.exe missing. Run scripts\setup_llm_env.ps1 first.' -ForegroundColor Red
+    exit 1
+}
+
+if (-not (Test-Path $mainFile)) {
+    Write-Host "[ERROR] main.py not found at $mainFile" -ForegroundColor Red
+    exit 1
+}
+
+$logsDir = Join-Path $root 'logs'
+if (-not (Test-Path $logsDir)) {
+    New-Item -ItemType Directory -Path $logsDir | Out-Null
+}
+
+$timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$logFile   = Join-Path $logsDir "llm_server_$timestamp.log"
+
+Write-Host "[LLM] Starting LLM server with: $pythonExe $mainFile" -ForegroundColor Cyan
+Write-Host "[LLM] Log file: $logFile"
+
+# Ejecutar el servidor y guardar log
+& $pythonExe $mainFile 2>&1 | Tee-Object -FilePath $logFile

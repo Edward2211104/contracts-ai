@@ -1,0 +1,69 @@
+﻿from fastapi import APIRouter
+from pydantic import BaseModel
+from typing import Optional
+
+from ..llm_proxy import call_lm_studio, answer_contract_question, logger
+
+
+router = APIRouter()
+
+
+class AskBodyBasic(BaseModel):
+    """
+    Cuerpo que recibe /llm/ask-basic desde tu servidor Node.
+
+    Campos:
+      - question: str
+      - contractText: str (opcional, texto completo del contrato)
+      - extraContext: str (opcional)
+    """
+
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+
+
+@router.post("/llm/ask-basic")
+def llm_ask_basic(body: AskBodyBasic):
+    """
+    Endpoint básico del LLM.
+
+    Si llega contractText => se llama al motor experto en contratos.
+    Si NO llega contractText => se usa un modo genérico (explicativo).
+    """
+    has_contract = bool(body.contractText and body.contractText.strip())
+    has_extra = bool(body.extraContext and body.extraContext.strip())
+
+    logger.info(
+        "Basic LLM question received (has_contract=%s, has_extra=%s)",
+        has_contract,
+        has_extra,
+    )
+
+    # 1) Modo experto en contratos (usa el texto completo)
+    if has_contract:
+        logger.info("Using contract-aware mode in /llm/ask-basic.")
+        answer = answer_contract_question(
+            question=body.question,
+            contract_text=body.contractText,
+            extra_context=body.extraContext or "",
+        )
+        return {"ok": True, "answer": answer}
+
+    # 2) Modo genérico (sin texto de contrato)
+    logger.info("Using generic LLM mode in /llm/ask-basic (no contractText).")
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "When the user does not provide the contract text, answer in general "
+        "terms and explain what clauses or information you would need to give "
+        "a precise, contract-specific answer."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": body.question},
+    ]
+
+    answer = call_lm_studio(messages)
+    return {"ok": True, "answer": answer}

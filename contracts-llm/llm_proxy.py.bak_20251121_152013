@@ -1,0 +1,208 @@
+﻿import logging
+import os
+from typing import List, Dict, Optional
+
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+# Logger sencillo
+logger = logging.getLogger("contracts-llm")
+logging.basicConfig(level=logging.INFO)
+
+# Donde está tu servidor de LM Studio (modo OpenAI)
+UPSTREAM_LLM_URL = os.getenv("UPSTREAM_LLM_URL", "http://127.0.0.1:1234")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "META-LLAMA-3-8B-Instruct")
+
+# FastAPI app que espera uvicorn:app
+app = FastAPI(title="Contracts LLM backend")
+
+
+class AskBodyBasic(BaseModel):
+    """
+    Cuerpo que recibe /llm/ask-basic desde tu servidor Node.
+
+    Campos:
+      - question: str
+      - contractText: texto completo del contrato (opcional)
+      - extraContext: contexto adicional (opcional)
+    """
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+
+
+def _extract_content_from_response(data: Dict) -> str:
+    """
+    Intenta extraer el texto de la respuesta del LLM.
+    Soporta varios formatos (message.content, text, delta, etc.).
+    Nunca devuelve cadena vacía: como último recurso devuelve todo el JSON.
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        logger.warning("Upstream LLM returned no choices: %s", data)
+        return data.get("answer") or data.get("content") or str(data)
+
+    choice0 = choices[0] or {}
+
+    # Formato estándar OpenAI: choices[0].message.content
+    message = choice0.get("message") or {}
+    content = message.get("content") or ""
+
+    # Algunos servidores usan choices[0].text
+    if not content and "text" in choice0:
+        content = choice0.get("text") or ""
+
+    # Otros usan choices[0].delta.content
+    if not content and "delta" in choice0:
+        delta = choice0.get("delta") or {}
+        content = delta.get("content") or ""
+
+    if not content:
+        logger.warning("Empty content in upstream response: %s", data)
+        content = data.get("answer") or data.get("content") or str(data)
+
+    return content
+
+
+def call_lm_studio(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+) -> str:
+    """
+    Llamada genérica al endpoint /v1/chat/completions de LM Studio.
+    """
+    url = f"{UPSTREAM_LLM_URL}/v1/chat/completions"
+    payload = {
+        "model": model or UPSTREAM_LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    logger.info(
+        "Calling upstream LLM at %s/v1/chat/completions with model %s",
+        UPSTREAM_LLM_URL,
+        payload["model"],
+    )
+
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return _extract_content_from_response(data)
+
+
+def build_contract_messages(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> List[Dict[str, str]]:
+    """
+    Construye el prompt para preguntas sobre contratos.
+    Siempre incluye el texto del contrato si está disponible.
+    """
+    contract_text = (contract_text or "").strip()
+    extra_context = (extra_context or "").strip()
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "Always base your answers strictly on the CONTRACT TEXT provided. "
+        "Quote or paraphrase key clauses and explain them in plain language. "
+        "If the contract does not clearly answer, say so explicitly and explain "
+        "what information is missing. Never invent clauses that are not present."
+    )
+
+    parts = [
+        "CONTRACT TEXT:",
+        contract_text or "[No contract text was provided.]",
+        "",
+        "QUESTION:",
+        question.strip(),
+    ]
+
+    if extra_context:
+        parts.extend(["", "ADDITIONAL CONTEXT:", extra_context])
+
+    user_message = "\n".join(parts)
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def answer_contract_question(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> str:
+    """
+    Punto de entrada de alto nivel para responder preguntas legales
+    usando el texto completo del contrato.
+    """
+    messages = build_contract_messages(
+        question=question,
+        contract_text=contract_text,
+        extra_context=extra_context,
+    )
+    return call_lm_studio(messages)
+
+
+# ----------------- ENDPOINTS FASTAPI -----------------
+
+
+@app.get("/health")
+async def health():
+    """
+    Endpoint simple para que tu script de Node compruebe que el backend vive.
+    """
+    return {"status": "ok"}
+
+
+@app.post("/llm/ask-basic")
+async def llm_ask_basic(body: AskBodyBasic):
+    """
+    Endpoint principal que usa tu server.js (Contracts-AI).
+
+    - Si viene contractText  -> modo experto en contratos (usa el texto completo).
+    - Si no viene contractText -> modo generalista (como un chat normal).
+    """
+    has_contract = bool(body.contractText and body.contractText.strip())
+    has_extra = bool(body.extraContext and body.extraContext.strip())
+
+    logger.info(
+        "Basic LLM question received (has_contract=%s, has_extra=%s)",
+        has_contract,
+        has_extra,
+    )
+
+    # 1) Modo experto en contratos
+    if has_contract:
+        logger.info("Using CONTRACT-AWARE mode in /llm/ask-basic.")
+        answer = answer_contract_question(
+            question=body.question,
+            contract_text=body.contractText,
+            extra_context=body.extraContext or "",
+        )
+        return {"ok": True, "answer": answer}
+
+    # 2) Modo general (sin contrato)
+    logger.info("Using GENERIC mode in /llm/ask-basic (no contractText).")
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "Answer clearly and precisely. If the user does not provide a contract "
+        "text, explain which clauses or information you would need to see."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": body.question},
+    ]
+
+    answer = call_lm_studio(messages)
+    return {"ok": True, "answer": answer}

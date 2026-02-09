@@ -1,0 +1,103 @@
+﻿import os
+from typing import Optional
+
+import httpx
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load environment variables from .env.llm if present
+_env_path = Path(__file__).with_name(".env.llm")
+if _env_path.exists():
+    load_dotenv(_env_path)
+
+
+def _build_prompt(question: str, context: Optional[str]) -> str:
+    """Build a prompt for the LLM as a contracts / insurance expert."""
+    base = (
+        "You are an expert insurance contracts and legal drafting assistant. "
+        "Explain clearly, accurately, and in plain language, but keep the legal meaning precise.\n\n"
+    )
+
+    parts = [base, f"User question:\n{question.strip()}\n"]
+    if context:
+        parts.append("\nRelevant contract/policy context:\n")
+        parts.append(context.strip())
+        parts.append("\n")
+    else:
+        parts.append("\n(No additional context provided.)\n")
+
+    return "".join(parts)
+
+
+async def _call_lmstudio(prompt: str) -> str:
+    """
+    Call LM Studio (or compatible OpenAI-style local server) using HTTP.
+
+    Expected env vars (in .env.llm or system env):
+      LLM_PROVIDER=lmstudio
+      LMSTUDIO_API_BASE=http://127.0.0.1:1234/v1
+      LMSTUDIO_MODEL=your-model-name
+    """
+    api_base = os.getenv("LMSTUDIO_API_BASE", "http://127.0.0.1:1234/v1").rstrip("/")
+    model = os.getenv("LMSTUDIO_MODEL", "local-model")
+    url = f"{api_base}/chat/completions"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a helpful legal contracts assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": float(os.getenv("LLM_TEMPERATURE", "0.2")),
+        "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "512")),
+        "stream": False,
+    }
+
+    timeout = httpx.Timeout(60.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    try:
+        # OpenAI / LM Studio compatible schema
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[LLM] Unexpected response schema from LM Studio: {exc!r}")
+        return str(data)
+
+
+async def ask_basic_llm(question: str, context: Optional[str] = None) -> str:
+    """
+    Main entry point used by main.py (/llm/ask-basic).
+
+    It tries to call LM Studio if LLM_PROVIDER=lmstudio, otherwise falls back
+    to a simple, explicit stub answer (so the app never returns an empty string).
+    """
+    provider = os.getenv("LLM_PROVIDER", "lmstudio").lower()
+    prompt = _build_prompt(question=question, context=context)
+
+    # Try provider-specific implementation
+    if provider == "lmstudio":
+        try:
+            answer = await _call_lmstudio(prompt)
+            if answer and answer.strip():
+                return answer.strip()
+        except Exception as exc:  # noqa: BLE001
+            # We do not crash – we log and fall back.
+            print(f"[LLM] Error talking to LM Studio: {exc!r}")
+
+    # Fallback: never return empty – at least echo something meaningful
+    fallback = [
+        "[LLM fallback] Could not reach the configured model.",
+        "",
+        "Here is a basic, non-AI response:",
+        "",
+        f"Question: {question}",
+    ]
+    if context:
+        fallback.append("")
+        fallback.append("Context snippet:")
+        fallback.append(context)
+
+    return "\n".join(fallback)

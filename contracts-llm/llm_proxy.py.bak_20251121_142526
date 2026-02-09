@@ -1,0 +1,170 @@
+﻿import os
+import logging
+from typing import Optional
+
+import requests
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+# -------------------------------------------------
+# Configuración básica
+# -------------------------------------------------
+
+logger = logging.getLogger("contracts-llm")
+logging.basicConfig(level=logging.INFO)
+
+UPSTREAM_LLM_URL = os.getenv(
+    "UPSTREAM_LLM_URL",
+    "http://127.0.0.1:1234/v1/chat/completions",
+)
+UPSTREAM_LLM_MODEL = os.getenv(
+    "UPSTREAM_LLM_MODEL",
+    "openai/gpt-oss-20b",
+)
+UPSTREAM_LLM_MAX_TOKENS = int(os.getenv("UPSTREAM_LLM_MAX_TOKENS", "1024"))
+
+app = FastAPI(title="Contracts LLM Proxy")
+
+# -------------------------------------------------
+# Modelos de datos
+# -------------------------------------------------
+
+
+class AskBody(BaseModel):
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+
+
+class BasicAskBody(BaseModel):
+    question: str
+
+
+class AskResponse(BaseModel):
+    ok: bool
+    answer: str
+
+
+# -------------------------------------------------
+# Utilidades
+# -------------------------------------------------
+
+
+def build_messages(question: str,
+                   contract_text: Optional[str],
+                   extra_context: Optional[str]):
+    """
+    Construye el prompt para el modelo de LM Studio.
+    """
+    system_prompt = (
+        "You are an expert lawyer specialized in commercial, insurance, "
+        "and lease contracts. Always answer in clear English. "
+        "Base your answer ONLY on the contract text and extra context "
+        "provided. If the information is not in the contract, say that "
+        "explicitly and avoid inventing details."
+    )
+
+    user_parts = []
+
+    if contract_text:
+        user_parts.append("CONTRACT TEXT:\n" + contract_text.strip())
+
+    if extra_context:
+        user_parts.append("EXTRA CONTEXT:\n" + extra_context.strip())
+
+    user_parts.append("QUESTION:\n" + question.strip())
+
+    user_content = "\n\n".join(user_parts)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    return messages
+
+
+def call_lm_studio(messages):
+    """
+    Llama al servidor local de LM Studio (OpenAI-compatible).
+    """
+    payload = {
+        "model": UPSTREAM_LLM_MODEL,
+        "messages": messages,
+        "max_tokens": UPSTREAM_LLM_MAX_TOKENS,
+        "temperature": 0.1,
+    }
+
+    logger.info("Calling upstream LLM at %s with model %s",
+                UPSTREAM_LLM_URL, UPSTREAM_LLM_MODEL)
+
+    resp = requests.post(UPSTREAM_LLM_URL, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Formato tipo OpenAI
+    content = data["choices"][0]["message"]["content"]
+    return content
+
+
+def answer_contract_question(question: str,
+                             contract_text: Optional[str],
+                             extra_context: Optional[str]) -> str:
+    """
+    Función de alto nivel: recibe pregunta y texto de contrato y
+    devuelve la respuesta del LLM.
+    """
+    messages = build_messages(
+        question=question,
+        contract_text=contract_text,
+        extra_context=extra_context,
+    )
+    answer = call_lm_studio(messages)
+    return answer
+
+
+# -------------------------------------------------
+# Endpoints FastAPI
+# -------------------------------------------------
+
+
+@app.get("/health")
+def health():
+    """
+    Usado por start_all.ps1 para comprobar que el backend está vivo.
+    """
+    return {"status": "ok"}
+
+
+@app.post("/rag/ask", response_model=AskResponse)
+def rag_ask(body: AskBody):
+    """
+    Endpoint principal para la app de contratos.
+    Recibe: question, contractText (opcional), extraContext (opcional).
+    """
+    logger.info(
+        "RAG /rag/ask for question (has_contract_text=%s)",
+        bool(body.contractText),
+    )
+
+    answer = answer_contract_question(
+        question=body.question,
+        contract_text=body.contractText,
+        extra_context=body.extraContext,
+    )
+
+    return AskResponse(ok=True, answer=answer)
+
+
+@app.post("/llm/ask-basic", response_model=AskResponse)
+def ask_basic(body: BasicAskBody):
+    """
+    Endpoint simplificado (sólo pregunta). Útil para pruebas básicas
+    desde la UI.
+    """
+    logger.info("Basic LLM question received.")
+    answer = answer_contract_question(
+        question=body.question,
+        contract_text=None,
+        extra_context=None,
+    )
+    return AskResponse(ok=True, answer=answer)

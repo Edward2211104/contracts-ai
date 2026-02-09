@@ -1,0 +1,79 @@
+﻿from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Optional
+
+from llm_proxy import call_lm_studio, answer_contract_question, logger
+
+
+app = FastAPI(title="Contracts LLM Backend")
+
+
+class AskBodyBasic(BaseModel):
+    """
+    Cuerpo que recibe /llm/ask-basic desde tu servidor Node.
+
+    Campos esperados:
+      - question: str
+      - (opcional) contractText: str con el texto del contrato
+      - (opcional) extraContext: str con contexto adicional
+    """
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+
+
+@app.get("/health")
+async def health():
+    """
+    Endpoint de salud usado por start_all.ps1.
+    Debe devolver 200 OK para que arranque la UI.
+    """
+    return {"status": "ok"}
+
+
+@app.post("/llm/ask-basic")
+async def llm_ask_basic(body: AskBodyBasic):
+    """
+    Endpoint básico del LLM.
+
+    Comportamiento:
+      - Si viene contractText ⇒ usamos el motor experto en contratos
+        (answer_contract_question) con ese texto.
+      - Si NO viene contractText ⇒ usamos el modo genérico de LLM
+        (call_lm_studio) como hasta ahora.
+    """
+    has_contract = bool(body.contractText and body.contractText.strip())
+    has_extra = bool(body.extraContext and body.extraContext.strip())
+
+    logger.info(
+        "Basic LLM question received (has_contract=%s, has_extra=%s)",
+        has_contract,
+        has_extra,
+    )
+
+    # 1) Camino "inteligente": tenemos texto de contrato
+    if has_contract:
+        logger.info("Using contract-aware mode in /llm/ask-basic.")
+        answer = answer_contract_question(
+            question=body.question,
+            contract_text=body.contractText,
+            extra_context=body.extraContext or "",
+        )
+        return {"ok": True, "answer": answer}
+
+    # 2) Camino de respaldo: sin contrato, respuesta general
+    logger.info("Using generic LLM mode in /llm/ask-basic (no contractText).")
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "Answer clearly and precisely. If the user does not provide a contract "
+        "or any clause text, explain what information you would need from the "
+        "contract to answer in detail."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": body.question},
+    ]
+
+    answer = call_lm_studio(messages)
+    return {"ok": True, "answer": answer}

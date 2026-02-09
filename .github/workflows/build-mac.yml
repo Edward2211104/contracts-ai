@@ -1,0 +1,50 @@
+﻿name: Build Mac App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install UI deps + build (optional)
+        run: |
+          cd contracts-ui
+          npm install
+          # If your UI supports build:
+          npm run build || true
+
+      - name: Install Gateway deps
+        run: |
+          cd contracts-gateway
+          npm install
+
+      - name: Setup Python backend venv (optional)
+        run: |
+          cd contracts-llm
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install fastapi uvicorn; fi
+
+      - name: Build Electron DMG
+        run: |
+          cd desktop
+          npm install
+          npm run build:mac
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ContractAIPro-mac-dmg
+          path: desktop/dist/*.dmg

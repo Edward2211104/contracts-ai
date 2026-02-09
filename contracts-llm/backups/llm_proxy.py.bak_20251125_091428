@@ -1,0 +1,199 @@
+﻿import logging
+import os
+import os
+from typing import List, Dict, Optional
+
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+# -----------------------------------------------------------------------------
+# Logging básico
+# -----------------------------------------------------------------------------
+logger = logging.getLogger("contracts-llm")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+
+# -----------------------------------------------------------------------------
+# Config de LM Studio
+# -----------------------------------------------------------------------------
+# Ejemplo de endpoint de LM Studio:
+#   http://localhost:1234/v1/chat/completions
+#
+# Aquí ponemos solo la base "http://localhost:1234" y luego añadimos
+# "/v1/chat/completions" en la llamada para NO duplicar el path.
+UPSTREAM_LLM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "model-identifier")
+
+
+def _chat_completion(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.25,
+    max_tokens: int = -1,
+) -> str:
+    """
+    Llamada directa al endpoint /v1/chat/completions del servidor LM Studio.
+    """
+    url = f"{UPSTREAM_LLM_URL}/v1/chat/completions"
+    payload = {
+        "model": model or UPSTREAM_LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+
+    logger.info(
+        "Calling upstream LLM at %s with model=%s",
+        url,
+        payload["model"],
+    )
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as e:
+        # Incluimos el cuerpo de la respuesta para depurar errores 400
+        text = ""
+        try:
+            text = e.response.text  # type: ignore[attr-defined]
+        except Exception:
+            text = str(e)
+        logger.error("Upstream LLM HTTP error: %s - body: %s", e, text)
+        # Esto es lo que verá la UI
+        raise RuntimeError(f"Upstream LLM error: {e}") from e
+
+    choices = data.get("choices") or []
+    if not choices:
+        logger.warning("Upstream LLM returned no choices: %s", data)
+        return ""
+
+    message = choices[0].get("message", {}) or {}
+    content = message.get("content", "") or ""
+    return content
+
+
+def call_lm_studio(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.25,
+    max_tokens: int = -1,
+) -> str:
+    """
+    Wrapper genérico.
+    """
+    return _chat_completion(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Construcción de prompts especializados en contratos
+# -----------------------------------------------------------------------------
+def build_contract_messages(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> List[Dict[str, str]]:
+    """
+    Prompt pensado para ser un "abogado experto" en contratos.
+    """
+    contract_text = (contract_text or "").strip()
+    extra_context = (extra_context or "").strip()
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease, and service contracts. "
+        "You must ALWAYS base your answers on the CONTRACT TEXT provided below. "
+        "When possible, quote or paraphrase the exact clauses and explain them "
+        "in clear, practical language for a non-lawyer. If the contract does "
+        "not clearly answer, say so explicitly and explain what is missing."
+    )
+
+    parts = []
+    parts.append("CONTRACT TEXT:")
+    parts.append(contract_text or "[No contract text was provided.]")
+    parts.append("")
+    parts.append("QUESTION:")
+    parts.append(question.strip())
+
+    if extra_context:
+        parts.append("")
+        parts.append("ADDITIONAL CONTEXT:")
+        parts.append(extra_context)
+
+    user_message = "\n".join(parts)
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def answer_contract_question(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> str:
+    """
+    Punto de entrada de alto nivel para preguntas sobre el contrato.
+    """
+    messages = build_contract_messages(
+        question=question,
+        contract_text=contract_text,
+        extra_context=extra_context,
+    )
+    return call_lm_studio(messages)
+
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Contracts LLM Backend")
+
+
+class AskBodyBasic(BaseModel):
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+
+
+@app.get("/health")
+async def health():
+    """
+    Usado por tu script Node para comprobar que el backend está vivo.
+    """
+    return {"status": "ok"}
+
+
+@app.post("/llm/ask-basic")
+async def llm_ask_basic(body: AskBodyBasic):
+    """
+    Endpoint que tu servidor Node llama desde /api/llm/ask-v2.
+    - Si hay contractText -> usa modo experto en contratos.
+    """
+    has_contract = bool(body.contractText and body.contractText.strip())
+    logger.info(
+        "Basic LLM question received (has_contract=%s)",
+        has_contract,
+    )
+
+    try:
+        answer = answer_contract_question(
+            question=body.question,
+            contract_text=body.contractText or "",
+            extra_context=body.extraContext or "",
+        )
+        return {"ok": True, "answer": answer}
+    except Exception as e:
+        logger.exception("Error answering contract question")
+        return {
+            "ok": False,
+            "answer": f"Upstream LLM error: {e}",
+        }

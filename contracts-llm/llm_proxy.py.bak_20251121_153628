@@ -1,0 +1,233 @@
+﻿import logging
+import os
+from typing import List, Dict, Optional
+
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+# ---------------------------------------------------------------------------
+# Configuración de logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("contracts-llm")
+
+# ---------------------------------------------------------------------------
+# Configuración del LLM upstream (LM Studio u otro servidor OpenAI-like)
+# ---------------------------------------------------------------------------
+# Ejemplos válidos de UPSTREAM_LLM_URL:
+#   - http://localhost:1234
+#   - http://localhost:1234/v1/chat/completions
+UPSTREAM_LLM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "META-LLAMA-3-8B-Instruct")
+
+
+def _resolve_chat_url() -> str:
+    """
+    Asegura que llamamos al endpoint correcto /v1/chat/completions,
+    sin duplicar el path si ya viene en la variable de entorno.
+    """
+    base = UPSTREAM_LLM_URL.rstrip("/")
+    if base.endswith("/v1/chat/completions"):
+        return base
+    return base + "/v1/chat/completions"
+
+
+def _chat(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> str:
+    """
+    Llamada básica al endpoint /v1/chat/completions del servidor local (LM Studio).
+    Devuelve el contenido del primer mensaje de la primera choice o un texto de error.
+    """
+    url = _resolve_chat_url()
+    payload = {
+        "model": model or UPSTREAM_LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    logger.info(
+        "Calling upstream LLM at %s with model %s",
+        url,
+        payload["model"],
+    )
+
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        logger.error("Error calling upstream LLM: %s", exc)
+        return f"Upstream LLM error: {exc}"
+
+    choices = data.get("choices") or []
+    if not choices:
+        logger.warning("Upstream LLM returned no choices: %s", data)
+        # Si el servidor devolvió un error en formato JSON, muéstralo
+        if "error" in data:
+            return f"Upstream LLM error: {data['error']}"
+        return "Upstream LLM returned no choices."
+
+    content = (
+        choices[0]
+        .get("message", {})
+        .get("content", "")
+        or ""
+    )
+    if not content.strip():
+        logger.warning("Upstream LLM returned empty content: %s", data)
+        return "Upstream LLM returned an empty answer."
+    return content
+
+
+def call_lm_studio(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> str:
+    """
+    Función genérica usada por otros módulos para llamar al LLM.
+    """
+    return _chat(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def build_contract_messages(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> List[Dict[str, str]]:
+    """
+    Construye el prompt para preguntas sobre contratos.
+    Siempre incluye el texto del contrato si está disponible.
+    """
+    contract_text = (contract_text or "").strip()
+    extra_context = (extra_context or "").strip()
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "Always base your answers on the CONTRACT TEXT provided. "
+        "Quote or paraphrase key clauses and explain them in plain language. "
+        "If the contract does not clearly answer, say so explicitly and explain "
+        "what information is missing."
+    )
+
+    parts = [
+        "CONTRACT TEXT:",
+        contract_text or "[No contract text was provided.]",
+        "",
+        "QUESTION:",
+        question.strip(),
+    ]
+
+    if extra_context:
+        parts.extend(["", "ADDITIONAL CONTEXT:", extra_context])
+
+    user_message = "\n".join(parts)
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def answer_contract_question(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> str:
+    """
+    Punto de entrada de alto nivel para responder preguntas legales
+    usando el texto completo del contrato.
+    """
+    messages = build_contract_messages(
+        question=question,
+        contract_text=contract_text,
+        extra_context=extra_context,
+    )
+    return call_lm_studio(messages)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Contracts LLM Backend")
+
+
+class AskBody(BaseModel):
+    """
+    Cuerpo que recibe /llm/ask-basic desde tu servidor Node.
+
+    Campos:
+      - question: str
+      - contractText: str (opcional) con el texto del contrato
+      - extraContext: str (opcional) con contexto adicional
+    """
+    question: str
+    contractText: Optional[str] = None
+    extraContext: Optional[str] = None
+
+
+@app.get("/health")
+async def health():
+    """
+    Endpoint simple de salud para que el script de Node compruebe
+    que el backend LLM está vivo.
+    """
+    return {"ok": True}
+
+
+@app.post("/llm/ask-basic")
+async def llm_ask_basic(body: AskBody):
+    """
+    Endpoint principal usado por tu servidor Node (/api/llm/ask-v2).
+
+    Comportamiento:
+      - Si viene contractText => modo experto en contratos.
+      - Si NO viene contractText => respuesta general del LLM.
+    """
+    has_contract = bool(body.contractText and body.contractText.strip())
+    has_extra = bool(body.extraContext and body.extraContext.strip())
+
+    logger.info(
+        "Basic LLM question received (has_contract=%s, has_extra=%s)",
+        has_contract,
+        has_extra,
+    )
+
+    if has_contract:
+        logger.info("Using contract-aware mode in /llm/ask-basic.")
+        answer = answer_contract_question(
+            question=body.question,
+            contract_text=body.contractText,
+            extra_context=body.extraContext or "",
+        )
+        return {"ok": True, "answer": answer}
+
+    # Sin contrato: modo general pero con rol de abogado experto
+    logger.info("Using generic LLM mode in /llm/ask-basic (no contractText).")
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "If the user does not provide any contract text, explain what information "
+        "you would need from the contract and give general guidance."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": body.question},
+    ]
+
+    answer = call_lm_studio(messages)
+    return {"ok": True, "answer": answer}

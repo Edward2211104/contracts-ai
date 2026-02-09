@@ -1,0 +1,160 @@
+﻿import logging
+import os
+from typing import List, Dict, Optional
+
+import httpx
+
+logger = logging.getLogger("contracts-llm")
+
+# URL y modelo del servidor LM Studio (OpenAI-like)
+UPSTREAM_LLM_URL = os.getenv("UPSTREAM_LLM_URL", "http://localhost:1234")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "META-LLAMA-3-8B-Instruct")
+
+
+def _extract_text(data) -> str:
+    """
+    Intenta extraer texto de varias formas posibles según el formato que
+    devuelva LM Studio (/v1/chat/completions o formatos parecidos).
+    """
+    try:
+        if not isinstance(data, dict):
+            return str(data)
+
+        # Formato típico OpenAI chat.completions
+        choices = data.get("choices") or []
+        if choices:
+            ch0 = choices[0] or {}
+            msg = ch0.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+
+            # A veces viene como "text"
+            text = ch0.get("text")
+            if isinstance(text, str) and text.strip():
+                return text
+
+        # Formatos alternativos tipo "output"
+        output = data.get("output")
+        if isinstance(output, list) and output:
+            item = output[0] or {}
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+
+        # Como último recurso, campo "answer"
+        ans = data.get("answer")
+        if isinstance(ans, str) and ans.strip():
+            return ans
+
+        return ""
+    except Exception:
+        logger.exception("Error extracting text from LLM response: %r", data)
+        return ""
+
+
+def _chat(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> str:
+    """
+    Llamada básica al endpoint /v1/chat/completions del servidor local (LM Studio).
+    """
+    url = f"{UPSTREAM_LLM_URL}/v1/chat/completions"
+    payload = {
+        "model": model or UPSTREAM_LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    logger.info(
+        "Calling upstream LLM at %s/v1/chat/completions with model %s",
+        UPSTREAM_LLM_URL,
+        payload["model"],
+    )
+
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    text = _extract_text(data)
+    if not text:
+        logger.warning("LLM returned empty text. Raw response: %s", data)
+    return text
+
+
+def call_lm_studio(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.2,
+    max_tokens: int = 512,
+) -> str:
+    """
+    Función genérica usada por otros módulos para llamar al LLM.
+    """
+    return _chat(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def build_contract_messages(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> List[Dict[str, str]]:
+    """
+    Construye el prompt para preguntas sobre contratos.
+    Siempre incluye el texto del contrato si está disponible.
+    """
+    contract_text = (contract_text or "").strip()
+    extra_context = (extra_context or "").strip()
+
+    system_prompt = (
+        "You are an expert lawyer in commercial, lease and insurance contracts. "
+        "Always base your answers on the CONTRACT TEXT provided. "
+        "Quote or paraphrase key clauses and explain them in plain language. "
+        "If the contract does not clearly answer, say so explicitly and explain "
+        "what information is missing."
+    )
+
+    parts = [
+        "CONTRACT TEXT:",
+        contract_text or "[No contract text was provided.]",
+        "",
+        "QUESTION:",
+        question.strip(),
+    ]
+
+    if extra_context:
+        parts.extend(["", "ADDITIONAL CONTEXT:", extra_context])
+
+    user_message = "\n".join(parts)
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+
+def answer_contract_question(
+    question: str,
+    contract_text: Optional[str],
+    extra_context: Optional[str] = "",
+) -> str:
+    """
+    Punto de entrada de alto nivel para responder preguntas legales
+    usando el texto completo del contrato.
+    """
+    messages = build_contract_messages(
+        question=question,
+        contract_text=contract_text,
+        extra_context=extra_context,
+    )
+    return call_lm_studio(messages)

@@ -1,0 +1,74 @@
+﻿from fastapi import FastAPI
+from pydantic import BaseModel
+import os
+import requests
+
+app = FastAPI()
+
+
+class AskRequest(BaseModel):
+    question: str
+    contractText: str
+    extraContext: str | None = ""
+
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+MODEL = os.getenv("CONTRACTS_LLM_MODEL", "llama3.1:latest")
+
+
+def build_prompt(question: str, contract_text: str, extra: str | None) -> str:
+    parts: list[str] = [
+        "You are an expert contract lawyer AI.",
+        "You answer in clear, professional English.",
+        "",
+        "CONTRACT TEXT:",
+        contract_text.strip(),
+        "",
+        "QUESTION:",
+        question.strip(),
+    ]
+    if extra:
+        parts.extend(["", "EXTRA CONTEXT:", extra.strip()])
+
+    parts.extend(
+        [
+            "",
+            "Instructions:",
+            "- Only use information that is actually present in the contract text.",
+            "- Quote clause numbers or exact sentences where possible.",
+            "- If the answer is not clearly stated, say you are not sure and explain why.",
+        ]
+    )
+
+    return "\n".join(parts)
+
+
+def call_ollama(prompt: str) -> str:
+    """
+    Call Ollama chat API with the chosen model and return the text answer.
+    """
+    url = f"{OLLAMA_URL.rstrip('/')}/api/chat"
+    payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+
+    resp = requests.post(url, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    message = data.get("message") or {}
+    content = message.get("content", "").strip()
+    if not content:
+        return "I could not generate an answer based on this contract."
+    return content
+
+
+@app.post("/llm/ask-basic")
+async def ask_basic(req: AskRequest):
+    """
+    Main endpoint used by Contracts-AI (via Node).
+    """
+    prompt = build_prompt(req.question, req.contractText, req.extraContext or "")
+    answer = call_ollama(prompt)
+    return {"answer": answer}

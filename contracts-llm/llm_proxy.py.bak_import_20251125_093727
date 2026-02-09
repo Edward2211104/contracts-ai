@@ -1,0 +1,120 @@
+﻿import os
+import logging
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+# -----------------------------------------
+# Configuración de logging
+# -----------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("contracts-llm")
+
+# -----------------------------------------
+# Configuración del LLM upstream
+# -----------------------------------------
+# Base URL del servidor de modelo (LM Studio / Ollama / OpenAI compatible).
+# IMPORTANTE: aquí SOLO la base, SIN el path final.
+UPSTREAM_LLM_BASE_URL = os.getenv("UPSTREAM_LLM_BASE_URL", "http://localhost:1234")
+UPSTREAM_LLM_MODEL = os.getenv("UPSTREAM_LLM_MODEL", "META-LLAMA-3-8B-Instruct")
+
+# URL completa del endpoint de chat OpenAI-compatible
+UPSTREAM_LLM_URL = UPSTREAM_LLM_BASE_URL.rstrip("/") + "/v1/chat/completions"
+
+logger.info("UPSTREAM_LLM_BASE_URL = %s", UPSTREAM_LLM_BASE_URL)
+logger.info("UPSTREAM_LLM_URL       = %s", UPSTREAM_LLM_URL)
+logger.info("UPSTREAM_LLM_MODEL     = %s", UPSTREAM_LLM_MODEL)
+
+# -----------------------------------------
+# Esquemas de petición / respuesta
+# -----------------------------------------
+class BasicAskRequest(BaseModel):
+    question: str
+    context: Optional[str] = None
+    has_contract: Optional[bool] = False
+
+
+class BasicAskResponse(BaseModel):
+    ok: bool
+    answer: str
+
+
+# -----------------------------------------
+# FastAPI app
+# -----------------------------------------
+app = FastAPI(
+    title="Contracts LLM Proxy",
+    description="Proxy entre Contracts-AI y un LLM OpenAI/LM-Studio compatible.",
+    version="0.1.0",
+)
+
+
+@app.get("/health")
+async def health():
+    """Endpoint simple de salud para comprobar que el proxy vive."""
+    return {"status": "ok"}
+
+
+@app.post("/llm/ask-basic", response_model=BasicAskResponse)
+async def ask_basic(payload: BasicAskRequest):
+    """
+    Pregunta básica al LLM, usada por /api/llm/ask-basic en el backend de Contracts-AI.
+    """
+    logger.info(
+        "Basic LLM question received (has_contract=%s)",
+        payload.has_contract,
+    )
+
+    # Construimos el prompt combinando contexto + pregunta
+    context_block = payload.context or ""
+    prompt = f"Question:\n{payload.question}\n\nContext:\n{context_block}".strip()
+
+    body = {
+        "model": UPSTREAM_LLM_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a highly skilled legal contracts assistant. "
+                    "Explain things clearly in simple language, but keep legal accuracy."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "temperature": 0.2,
+        "max_tokens": 512,
+    }
+
+    logger.info("Calling upstream LLM at %s", UPSTREAM_LLM_URL)
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(UPSTREAM_LLM_URL, json=body)
+    except Exception as exc:
+        logger.exception("Error calling upstream LLM")
+        raise HTTPException(status_code=500, detail=f"Upstream error: {exc}")
+
+    if resp.status_code >= 400:
+        logger.error("Upstream LLM HTTP %s: %s", resp.status_code, resp.text)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upstream status {resp.status_code}: {resp.text}",
+        )
+
+    data = resp.json()
+    answer_text = ""
+
+    try:
+        choices = data.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            answer_text = (msg.get("content") or "").strip()
+    except Exception:
+        logger.warning("Could not parse upstream response: %s", data)
+
+    return BasicAskResponse(ok=True, answer=answer_text)

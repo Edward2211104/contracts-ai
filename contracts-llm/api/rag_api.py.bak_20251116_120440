@@ -1,0 +1,32 @@
+﻿import os, numpy as np, pandas as pd, faiss
+from sentence_transformers import SentenceTransformer
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+IDXD = os.path.join(BASE_DIR, "data", "index")
+INDEX = os.path.join(IDXD, "faiss.index")
+META  = os.path.join(IDXD, "meta.parquet")
+if not (os.path.exists(INDEX) and os.path.exists(META)):
+    raise RuntimeError("Index not found. Run ingestion first.")
+
+index = faiss.read_index(INDEX)
+meta  = pd.read_parquet(META)
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+app = FastAPI(title="Contracts RAG API", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/health")
+def health():
+    return {"ok": True, "has_index": True, "chunks": int(meta.shape[0])}
+
+@app.post("/search")
+def search(question: str = Query(..., min_length=3), k: int = 5):
+    if meta.shape[0] == 0:
+        raise HTTPException(500, "Empty index")
+    emb = model.encode([question], normalize_embeddings=True)
+    D, I = index.search(np.asarray(emb, dtype="float32"), k)
+    rows = meta.iloc[I[0]].copy()
+    rows["score"] = D[0]
+    return {"ok": True, "results": rows.to_dict(orient="records")}

@@ -1,0 +1,87 @@
+﻿from fastapi import FastAPI
+from pydantic import BaseModel
+import os
+import requests
+
+app = FastAPI(title="contracts-llm", version="2.0.0")
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1")
+
+class AskRequest(BaseModel):
+    question: str
+    contractText: str
+    extraContext: str | None = None
+    topK: int | None = 12
+    returnK: int | None = 5
+
+class AskResponse(BaseModel):
+    ok: bool
+    answer: str | None = None
+    error: str | None = None
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "provider": "ollama", "model": LLM_MODEL}
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(req: AskRequest):
+    """
+    Central brain for Contracts-AI.
+    Receives the user question and the plain text of the contract,
+    calls Ollama and returns a clean JSON answer.
+    """
+    if not req.question.strip():
+        return AskResponse(ok=False, error="Question is empty.")
+    if not req.contractText.strip():
+        return AskResponse(ok=False, error="Contract text is empty.")
+
+    system_prompt = (
+        "You are an expert contract and lease lawyer. "
+        "Answer ONLY based on the contract text and additional context provided. "
+        "Be precise, concise and practical. If the contract does not clearly answer, "
+        "say that the contract is silent or unclear instead of inventing information."
+    )
+
+    user_prompt = (
+        "CONTRACT TEXT:\n"
+        "--------------------\n"
+        f"{req.contractText}\n"
+        "--------------------\n\n"
+        "EXTRA CONTEXT (metadata, dates, amounts, etc.):\n"
+        f"{req.extraContext or 'None'}\n\n"
+        "USER QUESTION:\n"
+        f"{req.question}\n\n"
+        "Now give a clear answer in English. "
+        "Use bullets when listing rights/obligations, and, if useful, quote the key clauses."
+    )
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+    }
+
+    try:
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=180)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return AskResponse(ok=False, error=f"Ollama request failed: {e}")
+
+    # Ollama /api/chat formats
+    content = ""
+    if isinstance(data, dict):
+        if "message" in data and isinstance(data["message"], dict):
+            content = data["message"].get("content") or ""
+        elif "response" in data:
+            content = data["response"] or ""
+        elif "choices" in data and data["choices"]:
+            content = data["choices"][0].get("message", {}).get("content", "") or ""
+    if not content:
+        return AskResponse(ok=False, error="Empty answer from LLM.")
+
+    return AskResponse(ok=True, answer=content.strip())
